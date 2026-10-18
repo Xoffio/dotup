@@ -1,0 +1,17 @@
+[package]
+name = "dotup"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+toml_edit = { version = "0.22", features = ["serde"] }
+anyhow = "1"
+semver = "1"
+ureq = "3"
+regex = "1"
+sha2 = "0.10"
