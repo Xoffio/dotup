@@ -284,16 +284,15 @@ impl App {
         self.generation += 1;
         let generation = self.generation;
         for (index, tool) in self.tools.iter_mut().enumerate() {
-            if !force {
-                if let Some(entry) = self.cache.entries.get(&tool.repo) {
-                    if entry.is_fresh() {
-                        tool.status = compare_versions(&tool.current_version, &entry.release.version);
-                        tool.latest_version = Some(entry.release.version.clone());
-                        tool.release_notes = Some(entry.release.notes.clone());
-                        tool.assets = entry.release.assets.clone();
-                        continue;
-                    }
-                }
+            if !force
+                && let Some(entry) = self.cache.entries.get(&tool.repo)
+                && entry.is_fresh()
+            {
+                tool.status = compare_versions(&tool.current_version, &entry.release.version);
+                tool.latest_version = Some(entry.release.version.clone());
+                tool.release_notes = Some(entry.release.notes.clone());
+                tool.assets = entry.release.assets.clone();
+                continue;
             }
             tool.status = Status::Checking;
             tool.latest_version = None;
@@ -438,11 +437,11 @@ impl App {
                     }
                     match result {
                         Ok(plan) => {
-                            if let Some(modal) = &mut self.update_modal {
-                                if modal.plan.tool_index == plan.tool_index {
-                                    modal.plan = plan;
-                                    modal.ready = true;
-                                }
+                            if let Some(modal) = &mut self.update_modal
+                                && modal.plan.tool_index == plan.tool_index
+                            {
+                                modal.plan = plan;
+                                modal.ready = true;
                             }
                         }
                         Err(e) => {
@@ -495,10 +494,10 @@ fn compare_versions(current: &str, latest: &str) -> Status {
 fn fetch_latest_version(repo: &str) -> std::result::Result<ReleaseInfo, String> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let mut request = ureq::get(&url);
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        if !token.is_empty() {
-            request = request.header("Authorization", &format!("Bearer {token}"));
-        }
+    if let Ok(token) = std::env::var("GITHUB_TOKEN")
+        && !token.is_empty()
+    {
+        request = request.header("Authorization", &format!("Bearer {token}"));
     }
     let mut response = request
         .call()
@@ -1100,7 +1099,7 @@ fn render_update_modal(frame: &mut Frame, modal: &UpdateModal) {
 
     // Center the modal.
     let area = frame.area();
-    let width = area.width.min(78).max(30);
+    let width = area.width.clamp(30, 78);
     let content_lines = lines.len() as u16 + 2; // + borders
     let height = content_lines.min(area.height.saturating_sub(2)).max(8);
     let vertical = Layout::default()
