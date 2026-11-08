@@ -19,7 +19,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +59,19 @@ enum Status {
     UpToDate,
     UpdateAvailable,
     Error,
+}
+
+impl Status {
+    /// Plain-text label used in the table and matched by the search filter.
+    fn label(self) -> &'static str {
+        match self {
+            Status::Unchecked => "-",
+            Status::Checking => "checking",
+            Status::UpToDate => "up to date",
+            Status::UpdateAvailable => "update available",
+            Status::Error => "error",
+        }
+    }
 }
 
 struct Tool {
@@ -202,6 +215,14 @@ struct App {
     update_modal: Option<UpdateModal>,
     /// transient status line message shown in the footer
     notice: Option<(String, Color)>,
+    /// indices into `tools` that pass the current filter, in display order
+    visible: Vec<usize>,
+    /// applied search pattern (empty = no filter)
+    filter: String,
+    /// pattern being typed after `/`; None when not in search mode
+    search_input: Option<String>,
+    /// true when the current pattern is not a valid regex
+    filter_error: bool,
 }
 
 struct UpdateModal {
@@ -223,6 +244,7 @@ impl App {
         if !tools.is_empty() {
             table_state.select(Some(0));
         }
+        let visible = (0..tools.len()).collect();
         Self {
             tools,
             table_state,
@@ -235,15 +257,19 @@ impl App {
             hashes,
             update_modal: None,
             notice: None,
+            visible,
+            filter: String::new(),
+            search_input: None,
+            filter_error: false,
         }
     }
 
     fn next(&mut self) {
-        if self.tools.is_empty() {
+        if self.visible.is_empty() {
             return;
         }
         let i = match self.table_state.selected() {
-            Some(i) => (i + 1) % self.tools.len(),
+            Some(i) => (i + 1) % self.visible.len(),
             None => 0,
         };
         self.table_state.select(Some(i));
@@ -251,15 +277,96 @@ impl App {
     }
 
     fn previous(&mut self) {
-        if self.tools.is_empty() {
+        if self.visible.is_empty() {
             return;
         }
         let i = match self.table_state.selected() {
-            Some(0) | None => self.tools.len() - 1,
+            Some(0) | None => self.visible.len() - 1,
             Some(i) => i - 1,
         };
         self.table_state.select(Some(i));
         self.details_scroll = 0;
+    }
+
+    /// Index into `tools` of the row currently highlighted in the table.
+    fn selected_index(&self) -> Option<usize> {
+        self.table_state
+            .selected()
+            .and_then(|i| self.visible.get(i).copied())
+    }
+
+    fn active_pattern(&self) -> &str {
+        self.search_input.as_deref().unwrap_or(&self.filter)
+    }
+
+    /// Recompute which tools pass the active pattern, matched case-insensitively
+    /// against name, repo, current/latest version and status. An invalid regex
+    /// shows everything and flags the error in the search bar.
+    fn rebuild_visible(&mut self) {
+        let pattern = self.active_pattern().to_string();
+        self.filter_error = false;
+        self.visible = if pattern.is_empty() {
+            (0..self.tools.len()).collect()
+        } else {
+            match RegexBuilder::new(&pattern).case_insensitive(true).build() {
+                Ok(re) => self
+                    .tools
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| {
+                        re.is_match(&t.name)
+                            || re.is_match(&t.repo)
+                            || re.is_match(&t.current_version)
+                            || t.latest_version.as_deref().is_some_and(|v| re.is_match(v))
+                            || re.is_match(t.status.label())
+                    })
+                    .map(|(i, _)| i)
+                    .collect(),
+                Err(_) => {
+                    self.filter_error = true;
+                    (0..self.tools.len()).collect()
+                }
+            }
+        };
+        let selection = match self.visible.len() {
+            0 => None,
+            n => Some(self.table_state.selected().unwrap_or(0).min(n - 1)),
+        };
+        self.table_state.select(selection);
+        self.details_scroll = 0;
+    }
+
+    fn start_search(&mut self) {
+        self.search_input = Some(self.filter.clone());
+    }
+
+    fn search_push(&mut self, c: char) {
+        if let Some(input) = self.search_input.as_mut() {
+            input.push(c);
+        }
+        self.rebuild_visible();
+    }
+
+    fn search_pop(&mut self) {
+        if let Some(input) = self.search_input.as_mut() {
+            input.pop();
+        }
+        self.rebuild_visible();
+    }
+
+    /// Enter: keep the typed pattern as the active filter.
+    fn search_confirm(&mut self) {
+        if let Some(input) = self.search_input.take() {
+            self.filter = input;
+        }
+        self.rebuild_visible();
+    }
+
+    /// Esc: drop the pattern and show every tool again.
+    fn clear_filter(&mut self) {
+        self.search_input = None;
+        self.filter.clear();
+        self.rebuild_visible();
     }
 
     fn scroll_details_down(&mut self) {
@@ -306,7 +413,7 @@ impl App {
     /// selected tool in the background. `dry_run` only previews; `!dry_run`
     /// asks for confirmation before writing.
     fn begin_update(&mut self, tx: mpsc::Sender<AppMsg>, dry_run: bool) {
-        let Some(index) = self.table_state.selected() else {
+        let Some(index) = self.selected_index() else {
             return;
         };
         let tool = &self.tools[index];
@@ -761,8 +868,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
     let spinner = SPINNER[app.tick % SPINNER.len()];
 
     let rows: Vec<Row> = app
-        .tools
+        .visible
         .iter()
+        .map(|&i| &app.tools[i])
         .map(|tool| {
             let latest = tool.latest_version.as_deref().unwrap_or("-");
             let (status_text, status_style) = match tool.status {
@@ -790,6 +898,17 @@ fn ui(frame: &mut Frame, app: &mut App) {
         })
         .collect();
 
+    let tools_title = if app.filter.is_empty() && app.search_input.is_none() {
+        " Tools ".to_string()
+    } else {
+        format!(
+            " Tools /{}/ ({}/{}) ",
+            app.active_pattern(),
+            app.visible.len(),
+            app.tools.len()
+        )
+    };
+
     let tools_border = if app.focus == Focus::Tools {
         Style::default().fg(Color::Cyan)
     } else {
@@ -808,7 +927,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
     .header(header)
     .block(
         Block::default()
-            .title(" Tools ")
+            .title(tools_title)
             .borders(Borders::ALL)
             .border_style(tools_border),
     )
@@ -822,7 +941,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
     frame.render_stateful_widget(table, body[0], &mut app.table_state);
 
     // Lower section: details of the selected tool
-    let selected = app.table_state.selected().and_then(|i| app.tools.get(i));
+    let selected = app.selected_index().and_then(|i| app.tools.get(i));
 
     let (details_title, details_lines) = match selected {
         Some(tool) => {
@@ -966,7 +1085,22 @@ fn ui(frame: &mut Frame, app: &mut App) {
     frame.render_widget(details, body[1]);
 
     // Footer: key hints, or a transient notice if one is active
-    let footer = if let Some((msg, color)) = &app.notice {
+    let footer = if let Some(input) = &app.search_input {
+        let mut spans = vec![
+            Span::styled(format!(" /{input}_"), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                "  Enter: keep  Esc: clear",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+        if app.filter_error {
+            spans.push(Span::styled(
+                "  invalid regex",
+                Style::default().fg(Color::Red),
+            ));
+        }
+        Line::from(spans)
+    } else if let Some((msg, color)) = &app.notice {
         Line::from(Span::styled(format!(" {msg}"), Style::default().fg(*color)))
     } else {
         Line::from(vec![
@@ -974,6 +1108,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
             Span::raw(": quit  "),
             Span::styled("r", Style::default().fg(Color::Yellow)),
             Span::raw(": refresh  "),
+            Span::styled("/", Style::default().fg(Color::Yellow)),
+            Span::raw(": search  "),
             Span::styled("d", Style::default().fg(Color::Yellow)),
             Span::raw(": dry-run  "),
             Span::styled("u", Style::default().fg(Color::Yellow)),
@@ -1179,8 +1315,22 @@ fn run_app(
                 continue;
             }
 
+            // While typing a search pattern, keys edit the pattern.
+            if app.search_input.is_some() {
+                match key.code {
+                    KeyCode::Char(c) => app.search_push(c),
+                    KeyCode::Backspace => app.search_pop(),
+                    KeyCode::Enter => app.search_confirm(),
+                    KeyCode::Esc => app.clear_filter(),
+                    _ => {}
+                }
+                continue;
+            }
+
             app.notice = None;
             match key.code {
+                KeyCode::Char('/') if app.focus == Focus::Tools => app.start_search(),
+                KeyCode::Esc if !app.filter.is_empty() => app.clear_filter(),
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                 KeyCode::Char('r') => {
                     let tx = tx.clone();
