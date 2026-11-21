@@ -16,8 +16,8 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Flex, Layout},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
+    text::{Line, Span, Text},
+    widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 use regex::{Regex, RegexBuilder};
 use semver::Version;
@@ -26,6 +26,18 @@ use serde::{Deserialize, Serialize};
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 /// How long a cached version check stays valid.
 const CACHE_TTL_SECS: u64 = 3600;
+
+/// Catppuccin Mocha palette (truecolor).
+const BG: Color = Color::Rgb(0x1e, 0x1e, 0x2e); // base
+const SURFACE: Color = Color::Rgb(0x31, 0x32, 0x44); // selection bg
+const BORDER: Color = Color::Rgb(0x45, 0x47, 0x5a); // dim borders
+const TEXT: Color = Color::Rgb(0xcd, 0xd6, 0xf4);
+const MUTED: Color = Color::Rgb(0x6c, 0x70, 0x86);
+const ACCENT: Color = Color::Rgb(0xb4, 0xbe, 0xfe); // lavender
+const GREEN: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
+const YELLOW: Color = Color::Rgb(0xf9, 0xe2, 0xaf);
+const RED: Color = Color::Rgb(0xf3, 0x8b, 0xa8);
+const TEAL: Color = Color::Rgb(0x89, 0xdc, 0xeb); // checking / section headers
 
 #[derive(Debug, Deserialize)]
 struct ToolsData {
@@ -74,18 +86,50 @@ impl Status {
     }
 }
 
+/// Which release dotup treats as the newest: the release GitHub flags as
+/// "Latest" (`/releases/latest`), or the highest semver among published
+/// non-prerelease releases. Maintainers can pin the GitHub flag to an
+/// older line, so the two can differ. Toggled with `m`; defaults to
+/// Latest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Mode {
+    #[default]
+    Latest,
+    Highest,
+}
+
+impl Mode {
+    fn toggle(self) -> Self {
+        match self {
+            Mode::Latest => Mode::Highest,
+            Mode::Highest => Mode::Latest,
+        }
+    }
+}
+
 struct Tool {
     name: String,
     repo: String,
     current_version: String,
-    latest_version: Option<String>,
-    release_notes: Option<String>,
-    /// sha256 digests of the latest release's assets: asset name -> hex digest
-    assets: Vec<AssetHash>,
+    /// Fetched release info for both modes, present once checked.
+    release: Option<ReleaseInfo>,
+    /// Human-readable reason for the last failed check, shown in details.
+    check_error: Option<String>,
     /// platform -> regex from [tools.<name>.dotup.assets]; empty if the tool
     /// has no dotup section (version-check only)
     asset_patterns: BTreeMap<String, Regex>,
     status: Status,
+}
+
+impl Tool {
+    /// The release the current mode considers newest. `Highest` falls back
+    /// to the flagged release when the semver scan is unavailable.
+    fn selected_release(&self, mode: Mode) -> Option<&Release> {
+        self.release.as_ref().map(|info| match mode {
+            Mode::Latest => &info.latest,
+            Mode::Highest => info.highest.as_ref().unwrap_or(&info.latest),
+        })
+    }
 }
 
 /// A release asset and its sha256 digest, when GitHub provides one.
@@ -125,6 +169,13 @@ struct UpdatePlan {
 /// Messages from background threads into the app loop.
 enum AppMsg {
     Check(CheckResult),
+    /// Result of the on-demand highest-semver scan triggered by switching
+    /// to `Highest` mode for a tool whose scan hasn't run yet.
+    HighestCheck {
+        generation: u64,
+        tool_index: usize,
+        result: std::result::Result<Option<Release>, String>,
+    },
     UpdatePrepared {
         generation: u64,
         result: std::result::Result<UpdatePlan, String>,
@@ -134,14 +185,29 @@ enum AppMsg {
 struct CheckResult {
     generation: u64,
     tool_index: usize,
-    result: std::result::Result<ReleaseInfo, String>,
+    result: std::result::Result<Release, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ReleaseInfo {
+struct Release {
     version: String,
     notes: String,
     assets: Vec<AssetHash>,
+}
+
+/// Both notions of "newest release" for one repo, cached together so the
+/// mode toggle never triggers a refetch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReleaseInfo {
+    /// The release GitHub flags as "Latest" (`/releases/latest`). Not
+    /// necessarily the highest version — maintainers can pin the flag to
+    /// an older line (opencode pins it to 1.x while 2.x releases exist).
+    latest: Release,
+    /// Highest semver among recent published, non-prerelease releases.
+    /// `None` when that list could not be fetched; the UI then falls back
+    /// to `latest`.
+    #[serde(default)]
+    highest: Option<Release>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +289,8 @@ struct App {
     search_input: Option<String>,
     /// true when the current pattern is not a valid regex
     filter_error: bool,
+    /// which release counts as "newest" (pill box, top right)
+    mode: Mode,
 }
 
 struct UpdateModal {
@@ -261,6 +329,7 @@ impl App {
             filter: String::new(),
             search_input: None,
             filter_error: false,
+            mode: Mode::default(),
         }
     }
 
@@ -317,7 +386,8 @@ impl App {
                         re.is_match(&t.name)
                             || re.is_match(&t.repo)
                             || re.is_match(&t.current_version)
-                            || t.latest_version.as_deref().is_some_and(|v| re.is_match(v))
+                            || t.selected_release(self.mode)
+                                .is_some_and(|r| re.is_match(&r.version))
                             || re.is_match(t.status.label())
                     })
                     .map(|(i, _)| i)
@@ -369,6 +439,36 @@ impl App {
         self.rebuild_visible();
     }
 
+    /// `m`: switch between the GitHub "Latest" flag and highest semver.
+    /// Tools whose highest-semver scan hasn't run yet (it is fetched
+    /// lazily to spare the GitHub rate limit) go to `checking` — but only
+    /// the ones currently visible; hidden ones just get their status
+    /// recomputed locally from already-fetched data, and are scanned the
+    /// next time they are visible and `m` is pressed.
+    fn toggle_mode(&mut self, tx: &mpsc::Sender<AppMsg>) {
+        self.mode = self.mode.toggle();
+        let mode = self.mode;
+        let generation = self.generation;
+        let visible: std::collections::HashSet<usize> =
+            self.visible.iter().copied().collect();
+        let mut scan_needed: Vec<(usize, String)> = Vec::new();
+        for (index, tool) in self.tools.iter_mut().enumerate() {
+            let needs_scan = mode == Mode::Highest
+                && tool.release.as_ref().is_some_and(|info| info.highest.is_none());
+            if needs_scan && visible.contains(&index) {
+                tool.status = Status::Checking;
+                tool.check_error = None;
+                scan_needed.push((index, tool.repo.clone()));
+            } else if let Some(rel) = tool.selected_release(mode) {
+                tool.status = compare_versions(&tool.current_version, &rel.version);
+            }
+        }
+        for (index, repo) in scan_needed {
+            spawn_highest_check(tx.clone(), generation, index, repo);
+        }
+        self.details_scroll = 0;
+    }
+
     fn scroll_details_down(&mut self) {
         self.details_scroll = self.details_scroll.saturating_add(1);
     }
@@ -385,26 +485,35 @@ impl App {
         self.focus = Focus::Tools;
     }
 
-    /// Check all tools. With `force = false` fresh cache entries are used
-    /// instead of hitting the network; `force = true` refetches everything.
+    /// Check tools. With `force = false` fresh cache entries are used
+    /// instead of hitting the network; `force = true` refetches. When a
+    /// filter is active only the visible tools are checked, to keep the
+    /// request count down. The generation is bumped only on a full round
+    /// (no filter): a partial round must not discard in-flight results of
+    /// the tools it didn't touch, or those would spin at `checking`
+    /// forever.
     fn refresh(&mut self, tx: mpsc::Sender<AppMsg>, force: bool) {
-        self.generation += 1;
+        let scope: Vec<usize> = self.visible.clone();
+        let full = scope.len() == self.tools.len();
+        if full {
+            self.generation += 1;
+        }
         let generation = self.generation;
-        for (index, tool) in self.tools.iter_mut().enumerate() {
+        for index in scope {
+            let tool = &mut self.tools[index];
             if !force
                 && let Some(entry) = self.cache.entries.get(&tool.repo)
                 && entry.is_fresh()
             {
-                tool.status = compare_versions(&tool.current_version, &entry.release.version);
-                tool.latest_version = Some(entry.release.version.clone());
-                tool.release_notes = Some(entry.release.notes.clone());
-                tool.assets = entry.release.assets.clone();
+                tool.release = Some(entry.release.clone());
+                if let Some(rel) = tool.selected_release(self.mode) {
+                    tool.status = compare_versions(&tool.current_version, &rel.version);
+                }
                 continue;
             }
             tool.status = Status::Checking;
-            tool.latest_version = None;
-            tool.release_notes = None;
-            tool.assets = Vec::new();
+            tool.release = None;
+            tool.check_error = None;
             spawn_check(tx.clone(), generation, index, tool.repo.clone());
         }
     }
@@ -416,30 +525,29 @@ impl App {
         let Some(index) = self.selected_index() else {
             return;
         };
+        let mode = self.mode;
         let tool = &self.tools[index];
 
         if tool.status != Status::UpdateAvailable {
-            self.notice = Some((
-                format!("{}: no update available", tool.name),
-                Color::DarkGray,
-            ));
+            self.notice = Some((format!("{}: no update available", tool.name), MUTED));
             return;
         }
         if tool.asset_patterns.is_empty() {
             self.notice = Some((
                 format!("{}: no dotup section in tools.toml — version-check only", tool.name),
-                Color::Red,
+                RED,
             ));
             return;
         }
-        let Some(latest) = tool.latest_version.clone() else {
+        let Some(sel) = tool.selected_release(mode) else {
             return;
         };
+        let latest = sel.version.clone();
 
         let generation = self.generation;
         let name = tool.name.clone();
         let current = tool.current_version.clone();
-        let assets = tool.assets.clone();
+        let assets = sel.assets.clone();
         let patterns: Vec<(String, Regex)> = tool
             .asset_patterns
             .iter()
@@ -488,18 +596,18 @@ impl App {
                 }
                 self.notice = Some((
                     format!("{} updated to {}", tool_name, plan.new_version),
-                    Color::Green,
+                    GREEN,
                 ));
                 // Re-check so the table shows "up to date" from real data.
                 self.refresh(tx, true);
             }
             Err(e) => {
-                self.notice = Some((format!("failed to write update: {e:#}"), Color::Red));
+                self.notice = Some((format!("failed to write update: {e:#}"), RED));
             }
         }
     }
 
-    fn handle_results(&mut self) {
+    fn handle_results(&mut self, tx: &mpsc::Sender<AppMsg>) {
         let mut cache_dirty = false;
         loop {
             match self.rx.try_recv() {
@@ -513,10 +621,30 @@ impl App {
                     };
                     match result.result {
                         Ok(release) => {
-                            tool.status = compare_versions(&tool.current_version, &release.version);
-                            tool.latest_version = Some(release.version.clone());
-                            tool.release_notes = Some(release.notes.clone());
-                            tool.assets = release.assets.clone();
+                            let mode = self.mode;
+                            let generation = result.generation;
+                            // The highest-semver scan is lazy: it runs on
+                            // demand to spare the GitHub rate limit, so a
+                            // fresh check starts without it.
+                            tool.release = Some(ReleaseInfo {
+                                latest: release.clone(),
+                                highest: None,
+                            });
+                            tool.check_error = None;
+                            if let Some(rel) = tool.selected_release(mode) {
+                                tool.status =
+                                    compare_versions(&tool.current_version, &rel.version);
+                            }
+                            // In Highest mode a fresh check without a scan
+                            // would silently fall back to the flagged
+                            // release; kick off the scan instead.
+                            if mode == Mode::Highest
+                                && tool.release.as_ref().is_some_and(|i| i.highest.is_none())
+                            {
+                                let index = result.tool_index;
+                                let repo = tool.repo.clone();
+                                spawn_highest_check(tx.clone(), generation, index, repo);
+                            }
                             let fetched_at = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .map(|d| d.as_secs())
@@ -525,16 +653,74 @@ impl App {
                                 tool.repo.clone(),
                                 CacheEntry {
                                     fetched_at,
-                                    release,
+                                    release: ReleaseInfo {
+                                        latest: release,
+                                        highest: None,
+                                    },
                                 },
                             );
                             cache_dirty = true;
                         }
-                        Err(_) => {
+                        Err(e) => {
                             tool.status = Status::Error;
-                            tool.latest_version = Some("-".to_string());
-                            tool.release_notes = None;
-                            tool.assets = Vec::new();
+                            tool.release = None;
+                            tool.check_error = Some(e);
+                        }
+                    }
+                }
+                Ok(AppMsg::HighestCheck {
+                    generation,
+                    tool_index,
+                    result,
+                }) => {
+                    if generation != self.generation {
+                        continue;
+                    }
+                    let Some(tool) = self.tools.get_mut(tool_index) else {
+                        continue;
+                    };
+                    let mode = self.mode;
+                    match result {
+                        Ok(Some(release)) => {
+                            if let Some(info) = &mut tool.release {
+                                info.highest = Some(release.clone());
+                            }
+                            if let Some(entry) = self.cache.entries.get_mut(&tool.repo) {
+                                entry.release.highest = Some(release);
+                            }
+                            tool.check_error = None;
+                            if let Some(rel) = tool.selected_release(mode) {
+                                tool.status =
+                                    compare_versions(&tool.current_version, &rel.version);
+                            }
+                            cache_dirty = true;
+                        }
+                        // No semver-parseable tags at all: remember the
+                        // flagged release as the highest so the scan is not
+                        // retried on every mode toggle.
+                        Ok(None) => {
+                            let fallback = tool.release.as_ref().map(|i| i.latest.clone());
+                            if let (Some(info), Some(fallback)) = (&mut tool.release, fallback) {
+                                info.highest = Some(fallback);
+                            }
+                            if let Some(rel) = tool.selected_release(mode) {
+                                tool.status =
+                                    compare_versions(&tool.current_version, &rel.version);
+                            }
+                        }
+                        Err(e) => {
+                            tool.check_error = Some(e);
+                            // Without a scan, Highest mode has nothing real
+                            // to compare against; only fall back to the
+                            // flagged release when that is what is shown.
+                            if mode == Mode::Highest
+                                && tool.release.as_ref().is_none_or(|i| i.highest.is_none())
+                            {
+                                tool.status = Status::Error;
+                            } else if let Some(rel) = tool.selected_release(mode) {
+                                tool.status =
+                                    compare_versions(&tool.current_version, &rel.version);
+                            }
                         }
                     }
                 }
@@ -553,7 +739,7 @@ impl App {
                         }
                         Err(e) => {
                             self.update_modal = None;
-                            self.notice = Some((format!("update prep failed: {e}"), Color::Red));
+                            self.notice = Some((format!("update prep failed: {e}"), RED));
                         }
                     }
                 }
@@ -598,9 +784,9 @@ fn compare_versions(current: &str, latest: &str) -> Status {
     }
 }
 
-fn fetch_latest_version(repo: &str) -> std::result::Result<ReleaseInfo, String> {
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let mut request = ureq::get(&url);
+/// GET a GitHub API endpoint and parse the JSON body.
+fn github_get_json(url: &str) -> std::result::Result<serde_json::Value, String> {
+    let mut request = ureq::get(url);
     if let Ok(token) = std::env::var("GITHUB_TOKEN")
         && !token.is_empty()
     {
@@ -609,56 +795,132 @@ fn fetch_latest_version(repo: &str) -> std::result::Result<ReleaseInfo, String> 
     let mut response = request
         .call()
         .map_err(|e| format!("request failed: {e}"))?;
-    let body: serde_json::Value = serde_json::from_str(
+    // Surface HTTP errors with GitHub's own message (e.g. rate limits)
+    // instead of failing later on an unrelated JSON parse.
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        let message = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v.get("message")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| body.chars().take(120).collect());
+        return Err(format!("HTTP {status}: {message}"));
+    }
+    serde_json::from_str(
         &response
             .body_mut()
             .read_to_string()
             .map_err(|e| format!("failed to read response: {e}"))?,
     )
-    .map_err(|e| format!("invalid json: {e}"))?;
+    .map_err(|e| format!("invalid json: {e}"))
+}
 
+/// Collect a release's assets and their digests from the GitHub API.
+fn parse_assets(assets: &[serde_json::Value]) -> Vec<AssetHash> {
+    assets
+        .iter()
+        .filter_map(|asset| {
+            let name = asset.get("name")?.as_str()?.to_string();
+            // GitHub exposes digests as "sha256:<hex>" when available.
+            let sha256 = asset
+                .get("digest")
+                .and_then(|d| d.as_str())
+                .and_then(|d| d.strip_prefix("sha256:"))
+                .map(|d| d.to_string());
+            let url = asset
+                .get("browser_download_url")
+                .and_then(|u| u.as_str())
+                .unwrap_or_default()
+                .to_string();
+            Some(AssetHash { name, sha256, url })
+        })
+        .collect()
+}
+
+/// Extract a release from a GitHub API release object; `None` when the
+/// object has no tag_name.
+fn release_from_json(body: &serde_json::Value) -> Option<Release> {
     let version = body
-        .get("tag_name")
-        .and_then(|tag| tag.as_str())
-        .map(|tag| tag.trim_start_matches(['v', 'V']).to_string())
-        .ok_or_else(|| "no tag_name in response".to_string())?;
-
+        .get("tag_name")?
+        .as_str()?
+        .trim_start_matches(['v', 'V'])
+        .to_string();
     let notes = body
         .get("body")
         .and_then(|b| b.as_str())
         .unwrap_or("No release notes.")
         .to_string();
-
     let assets = body
         .get("assets")
         .and_then(|a| a.as_array())
-        .map(|assets| {
-            assets
-                .iter()
-                .filter_map(|asset| {
-                    let name = asset.get("name")?.as_str()?.to_string();
-                    // GitHub exposes digests as "sha256:<hex>" when available.
-                    let sha256 = asset
-                        .get("digest")
-                        .and_then(|d| d.as_str())
-                        .and_then(|d| d.strip_prefix("sha256:"))
-                        .map(|d| d.to_string());
-                    let url = asset
-                        .get("browser_download_url")
-                        .and_then(|u| u.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    Some(AssetHash { name, sha256, url })
-                })
-                .collect()
-        })
+        .map(|a| parse_assets(a))
         .unwrap_or_default();
-
-    Ok(ReleaseInfo {
+    Some(Release {
         version,
         notes,
         assets,
     })
+}
+
+/// Fetch the release GitHub flags as "Latest". The highest-semver scan is
+/// deliberately NOT part of this: it costs a second API request per repo
+/// and would double dotup's rate-limit usage, so it is fetched lazily when
+/// the user switches to `Highest` mode.
+/// Color for the new version in an "old → new" transition, tinted by the
+/// size of the bump: major red, minor yellow, patch dim. Non-semver
+/// versions fall back to a generic "update" yellow.
+fn severity_color(current: &str, latest: &str) -> Color {
+    match (
+        Version::parse(version_part(current)),
+        Version::parse(version_part(latest)),
+    ) {
+        (Ok(c), Ok(l)) if l.major > c.major => RED,
+        (Ok(c), Ok(l)) if l.minor > c.minor => YELLOW,
+        (Ok(_), Ok(_)) => MUTED,
+        _ => YELLOW,
+    }
+}
+
+fn fetch_flagged_latest(repo: &str) -> std::result::Result<Release, String> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let body = github_get_json(&url)?;
+    release_from_json(&body).ok_or_else(|| "no tag_name in response".to_string())
+}
+
+/// Highest semver among the most recent published, non-prerelease
+/// releases. `None` when no tag parses as semver.
+fn fetch_highest_semver(repo: &str) -> std::result::Result<Option<Release>, String> {
+    let url = format!("https://api.github.com/repos/{repo}/releases?per_page=30");
+    let body = github_get_json(&url)?;
+    let releases = body
+        .as_array()
+        .ok_or_else(|| "releases: expected an array".to_string())?;
+    Ok(best_semver_release(releases))
+}
+
+/// Pick the highest-semver release from GitHub API release objects,
+/// skipping drafts, prereleases and tags that don't parse as semver.
+fn best_semver_release(releases: &[serde_json::Value]) -> Option<Release> {
+    releases
+        .iter()
+        .filter(|rel| {
+            !rel.get("draft").and_then(|v| v.as_bool()).unwrap_or(false)
+                && !rel
+                    .get("prerelease")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+        })
+        .filter_map(|rel| {
+            let release = release_from_json(rel)?;
+            let version = Version::parse(version_part(&release.version)).ok()?;
+            Some((version, release))
+        })
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, release)| release)
 }
 
 /// Build an UpdatePlan for a tool: match each platform regex against the
@@ -777,13 +1039,31 @@ fn spawn_check(
     repo: String,
 ) {
     thread::spawn(move || {
-        let result = fetch_latest_version(&repo);
+        let result = fetch_flagged_latest(&repo);
         // If the receiver is gone the app is exiting; ignore the error.
         let _ = tx.send(AppMsg::Check(CheckResult {
             generation,
             tool_index,
             result,
         }));
+    });
+}
+
+/// Fetch the highest-semver release for one tool in the background
+/// (triggered by switching to `Highest` mode).
+fn spawn_highest_check(
+    tx: mpsc::Sender<AppMsg>,
+    generation: u64,
+    tool_index: usize,
+    repo: String,
+) {
+    thread::spawn(move || {
+        let result = fetch_highest_semver(&repo);
+        let _ = tx.send(AppMsg::HighestCheck {
+            generation,
+            tool_index,
+            result,
+        });
     });
 }
 
@@ -823,9 +1103,8 @@ fn load_tools() -> Result<Vec<Tool>> {
                 name,
                 repo: entry.repo,
                 current_version: entry.version,
-                latest_version: None,
-                release_notes: None,
-                assets: Vec::new(),
+                release: None,
+                check_error: None,
                 asset_patterns,
                 status: Status::Unchecked,
             })
@@ -844,7 +1123,65 @@ fn load_hashes() -> BTreeMap<String, BTreeMap<String, String>> {
         .unwrap_or_default()
 }
 
+/// Dim hint shown under the status line when the two notions of "newest"
+/// differ, pointing at the other mode's version.
+fn other_version_hint(tool: &Tool, mode: Mode) -> Option<Line<'static>> {
+    let info = tool.release.as_ref()?;
+    let (selected, other, label) = match mode {
+        Mode::Latest => (&info.latest, info.highest.as_ref()?, "highest semver"),
+        Mode::Highest => (info.highest.as_ref()?, &info.latest, "github \"latest\""),
+    };
+    if version_part(&selected.version) == version_part(&other.version) {
+        return None;
+    }
+    Some(Line::from(Span::styled(
+        format!(" {label}: {}  (m: switch)", other.version),
+        Style::default().fg(MUTED),
+    )))
+}
+
+/// The latest/highest selector rendered as a segmented pill box, top
+/// right: the active segment is accent-filled, the inactive one muted.
+fn mode_pill(mode: Mode) -> Line<'static> {
+    let on = Style::default()
+        .bg(ACCENT)
+        .fg(BG)
+        .add_modifier(Modifier::BOLD);
+    let off = Style::default().fg(MUTED);
+    let (latest, highest) = match mode {
+        Mode::Latest => (on, off),
+        Mode::Highest => (off, on),
+    };
+    Line::from(vec![
+        Span::styled(" latest ", latest),
+        Span::styled(" · ", Style::default().fg(MUTED)),
+        Span::styled(" highest ", highest),
+    ])
+    .right_aligned()
+}
+
+/// A footer key hint: the key as a small pill (ACCENT on SURFACE) with a
+/// muted label next to it.
+fn key_chip(key: &str, label: &str) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(
+            format!(" {key} "),
+            Style::default()
+                .bg(SURFACE)
+                .fg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" {label} "), Style::default().fg(MUTED)),
+    ]
+}
+
 fn ui(frame: &mut Frame, app: &mut App) {
+    // Canvas: fill the whole screen with the palette base.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(BG).fg(TEXT)),
+        frame.area(),
+    );
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -858,12 +1195,27 @@ fn ui(frame: &mut Frame, app: &mut App) {
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(chunks[0]);
 
-    // Upper section: tools table
-    let header = Row::new(vec!["Tool", "Current", "Latest", "Status"]).style(
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    );
+    // Upper section: tools table. The header carries a thin separator line
+    // as its second row (clipped to each column's width).
+    let header_style = Style::default()
+        .fg(MUTED)
+        .add_modifier(Modifier::BOLD);
+    let separator =
+        Line::from(Span::styled("─".repeat(64), Style::default().fg(BORDER)));
+    let header = Row::new(vec![
+        Cell::from(Text::from(vec![
+            Line::from(Span::styled("TOOL", header_style)),
+            separator.clone(),
+        ])),
+        Cell::from(Text::from(vec![
+            Line::from(Span::styled("VERSION", header_style)),
+            separator.clone(),
+        ])),
+        Cell::from(Text::from(vec![
+            Line::from(Span::styled("STATUS", header_style)),
+            separator,
+        ])),
+    ]);
 
     let spinner = SPINNER[app.tick % SPINNER.len()];
 
@@ -872,89 +1224,199 @@ fn ui(frame: &mut Frame, app: &mut App) {
         .iter()
         .map(|&i| &app.tools[i])
         .map(|tool| {
-            let latest = tool.latest_version.as_deref().unwrap_or("-");
-            let (status_text, status_style) = match tool.status {
-                Status::Unchecked => ("-".to_string(), Style::default().fg(Color::DarkGray)),
-                Status::Checking => (
-                    format!("{spinner} checking…"),
-                    Style::default().fg(Color::Cyan),
+            let sel = tool.selected_release(app.mode);
+            // Attention rows keep full-color text; everything else is muted.
+            let (name_style, version_line, status_line) = match (tool.status, sel) {
+                (Status::UpdateAvailable, Some(rel)) => {
+                    let sev = severity_color(&tool.current_version, &rel.version);
+                    (
+                        TEXT,
+                        Line::from(vec![
+                            Span::styled(
+                                tool.current_version.clone(),
+                                Style::default().fg(TEXT),
+                            ),
+                            Span::styled(" → ", Style::default().fg(MUTED)),
+                            Span::styled(
+                                rel.version.clone(),
+                                Style::default()
+                                    .fg(sev)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]),
+                        Line::from(vec![
+                            Span::styled(
+                                "↑ ",
+                                Style::default()
+                                    .fg(YELLOW)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled("update available", Style::default().fg(YELLOW)),
+                        ]),
+                    )
+                }
+                (Status::UpToDate, Some(_)) => (
+                    MUTED,
+                    Line::from(Span::styled(
+                        tool.current_version.clone(),
+                        Style::default().fg(MUTED),
+                    )),
+                    Line::from(vec![
+                        Span::styled(
+                            "✔ ",
+                            Style::default().fg(GREEN).add_modifier(Modifier::DIM),
+                        ),
+                        Span::styled("up to date", Style::default().fg(MUTED)),
+                    ]),
                 ),
-                Status::UpToDate => (
-                    "up to date".to_string(),
-                    Style::default().fg(Color::Green),
+                (Status::Checking, _) => (
+                    TEXT,
+                    Line::from(Span::styled(
+                        tool.current_version.clone(),
+                        Style::default().fg(MUTED),
+                    )),
+                    Line::from(Span::styled(
+                        format!("{spinner} checking…"),
+                        Style::default().fg(TEAL),
+                    )),
                 ),
-                Status::UpdateAvailable => (
-                    "update available".to_string(),
-                    Style::default().fg(Color::Yellow),
+                (Status::Error, _) => (
+                    TEXT,
+                    Line::from(Span::styled(
+                        tool.current_version.clone(),
+                        Style::default().fg(MUTED),
+                    )),
+                    Line::from(vec![
+                        Span::styled("✖ ", Style::default().fg(RED)),
+                        Span::styled("error", Style::default().fg(RED)),
+                    ]),
                 ),
-                Status::Error => ("error".to_string(), Style::default().fg(Color::Red)),
+                // Defensive: a status derived from a release that has since
+                // gone missing, or not yet checked.
+                (
+                    Status::Unchecked | Status::UpdateAvailable | Status::UpToDate,
+                    _,
+                ) => (
+                    MUTED,
+                    Line::from(Span::styled(
+                        tool.current_version.clone(),
+                        Style::default().fg(MUTED),
+                    )),
+                    Line::from(Span::styled("-", Style::default().fg(MUTED))),
+                ),
             };
             Row::new(vec![
-                Cell::from(tool.name.clone()),
-                Cell::from(tool.current_version.clone()),
-                Cell::from(latest.to_string()),
-                Cell::from(status_text).style(status_style),
+                Cell::from(Line::from(Span::styled(
+                    tool.name.clone(),
+                    Style::default().fg(name_style),
+                ))),
+                Cell::from(version_line),
+                Cell::from(status_line),
             ])
         })
         .collect();
 
-    let tools_title = if app.filter.is_empty() && app.search_input.is_none() {
-        " Tools ".to_string()
-    } else {
-        format!(
-            " Tools /{}/ ({}/{}) ",
-            app.active_pattern(),
-            app.visible.len(),
-            app.tools.len()
-        )
-    };
+    // Tools title: pane name (accent when focused), filter state, and a
+    // colored summary of what currently needs attention.
+    let focused = app.focus == Focus::Tools;
+    let title_style = Style::default()
+        .fg(if focused { ACCENT } else { MUTED })
+        .add_modifier(Modifier::BOLD);
+    let mut title_spans = vec![Span::styled(" Tools ", title_style)];
+    if !app.filter.is_empty() || app.search_input.is_some() {
+        title_spans.push(Span::styled(
+            format!(
+                "/{}/ ({}/{}) ",
+                app.active_pattern(),
+                app.visible.len(),
+                app.tools.len()
+            ),
+            Style::default().fg(MUTED),
+        ));
+    }
+    let mut updates = 0usize;
+    let mut errors = 0usize;
+    let mut current = 0usize;
+    for &i in &app.visible {
+        match app.tools[i].status {
+            Status::UpdateAvailable => updates += 1,
+            Status::Error => errors += 1,
+            Status::UpToDate => current += 1,
+            _ => {}
+        }
+    }
+    let summary: Vec<(usize, &str, Color)> = [
+        (updates, "updates", YELLOW),
+        (errors, "errors", RED),
+        (current, "current", GREEN),
+    ]
+    .into_iter()
+    .filter(|(n, _, _)| *n > 0)
+    .collect();
+    if !summary.is_empty() {
+        title_spans.push(Span::raw(" "));
+        for (n, (count, label, color)) in summary.iter().enumerate() {
+            if n > 0 {
+                title_spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
+            }
+            title_spans.push(Span::styled(
+                format!("{count} {label}"),
+                Style::default().fg(*color),
+            ));
+        }
+    }
 
-    let tools_border = if app.focus == Focus::Tools {
-        Style::default().fg(Color::Cyan)
+    let tools_border = if focused {
+        Style::default().fg(ACCENT)
     } else {
-        Style::default()
+        Style::default().fg(BORDER)
     };
 
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(30),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(20),
+            Constraint::Fill(1),
+            Constraint::Length(34),
+            Constraint::Length(20),
         ],
     )
     .header(header)
     .block(
         Block::default()
-            .title(tools_title)
+            .title(Line::from(title_spans))
+            .title(mode_pill(app.mode))
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(tools_border),
     )
-    .row_highlight_style(
-        Style::default()
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    )
-    .highlight_symbol(">> ");
+    .row_highlight_style(Style::default().bg(SURFACE).fg(ACCENT))
+    .highlight_symbol("▌ ");
 
     frame.render_stateful_widget(table, body[0], &mut app.table_state);
 
     // Lower section: details of the selected tool
     let selected = app.selected_index().and_then(|i| app.tools.get(i));
+    let details_focused = app.focus == Focus::Details;
+    let details_title_style = Style::default()
+        .fg(if details_focused { ACCENT } else { MUTED })
+        .add_modifier(Modifier::BOLD);
 
     let (details_title, details_lines) = match selected {
         Some(tool) => {
-            let title = format!(" {} {} ", tool.name, tool.current_version);
+            let title = Line::from(Span::styled(
+                format!(" {} {} ", tool.name, tool.current_version),
+                details_title_style,
+            ));
+            let mode = app.mode;
+            let sel = tool.selected_release(mode);
 
             // Asset hashes section, shared by the update-available and
             // up-to-date views (whenever we have fetched release data).
             // Shown before the release notes since it is the actionable data;
             // long notes then follow below.
-            let asset_lines = |lines: &mut Vec<Line>| {
+            let asset_lines = |assets: &[AssetHash], lines: &mut Vec<Line>| {
                 // Skip checksum sidecar files; they add noise without value here.
-                let assets: Vec<&AssetHash> = tool
-                    .assets
+                let assets: Vec<&AssetHash> = assets
                     .iter()
                     .filter(|a| {
                         !a.name.ends_with(".sha256")
@@ -966,25 +1428,31 @@ fn ui(frame: &mut Frame, app: &mut App) {
                     return;
                 }
                 lines.push(Line::from(Span::styled(
-                    "Assets (latest release):",
+                    "Assets (newest release):",
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(TEAL)
                         .add_modifier(Modifier::BOLD),
                 )));
                 for asset in assets {
                     match &asset.sha256 {
                         Some(hash) => lines.push(Line::from(vec![
-                            Span::raw(format!("  {}", asset.name)),
+                            Span::styled(
+                                format!("  {}", asset.name),
+                                Style::default().fg(TEXT),
+                            ),
                             Span::styled(
                                 format!("  sha256:{hash}"),
-                                Style::default().fg(Color::DarkGray),
+                                Style::default().fg(MUTED),
                             ),
                         ])),
                         None => lines.push(Line::from(vec![
-                            Span::raw(format!("  {}", asset.name)),
+                            Span::styled(
+                                format!("  {}", asset.name),
+                                Style::default().fg(TEXT),
+                            ),
                             Span::styled(
                                 "  (no digest published)",
-                                Style::default().fg(Color::DarkGray),
+                                Style::default().fg(MUTED),
                             ),
                         ])),
                     }
@@ -992,77 +1460,90 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 lines.push(Line::from(""));
             };
 
-            match tool.status {
-                Status::UpdateAvailable => {
-                    let mut lines = vec![
-                        Line::from(vec![
-                            Span::styled("Update available: ", Style::default().fg(Color::Yellow)),
-                            Span::styled(
-                                format!(
-                                    "{} → {}",
-                                    tool.current_version,
-                                    tool.latest_version.as_deref().unwrap_or("?")
-                                ),
-                                Style::default()
-                                    .fg(Color::Yellow)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ]),
-                        Line::from(""),
-                    ];
-                    asset_lines(&mut lines);
-                    match &tool.release_notes {
-                        Some(notes) if !notes.trim().is_empty() => {
-                            lines.push(Line::from(Span::styled(
-                                "Release notes:",
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD),
-                            )));
-                            lines.extend(notes.lines().map(|l| Line::from(l.to_string())));
-                        }
-                        _ => lines.push(Line::from(Span::styled(
+            match (tool.status, sel) {
+                (Status::UpdateAvailable, Some(sel)) => {
+                    let sev = severity_color(&tool.current_version, &sel.version);
+                    let mut lines = vec![Line::from(vec![
+                        Span::styled("Update available: ", Style::default().fg(YELLOW)),
+                        Span::styled(
+                            tool.current_version.clone(),
+                            Style::default().fg(TEXT),
+                        ),
+                        Span::styled(" → ", Style::default().fg(MUTED)),
+                        Span::styled(
+                            sel.version.clone(),
+                            Style::default().fg(sev).add_modifier(Modifier::BOLD),
+                        ),
+                    ])];
+                    if let Some(hint) = other_version_hint(tool, mode) {
+                        lines.push(hint);
+                    }
+                    lines.push(Line::from(""));
+                    asset_lines(&sel.assets, &mut lines);
+                    if sel.notes.trim().is_empty() {
+                        lines.push(Line::from(Span::styled(
                             "No release notes.",
-                            Style::default().fg(Color::DarkGray),
-                        ))),
+                            Style::default().fg(MUTED),
+                        )));
+                    } else {
+                        lines.push(Line::from(Span::styled(
+                            "Release notes:",
+                            Style::default()
+                                .fg(TEAL)
+                                .add_modifier(Modifier::BOLD),
+                        )));
+                        lines.extend(sel.notes.lines().map(|l| Line::from(l.to_string())));
                     }
                     (title, lines)
                 }
-                Status::UpToDate => {
-                    let mut lines = vec![
-                        Line::from(Span::styled(
-                            "Up to date.",
-                            Style::default().fg(Color::Green),
-                        )),
-                        Line::from(""),
-                    ];
-                    asset_lines(&mut lines);
+                (Status::UpToDate, Some(sel)) => {
+                    let mut lines = vec![Line::from(Span::styled(
+                        "Up to date.",
+                        Style::default().fg(GREEN),
+                    ))];
+                    if let Some(hint) = other_version_hint(tool, mode) {
+                        lines.push(hint);
+                    }
+                    lines.push(Line::from(""));
+                    asset_lines(&sel.assets, &mut lines);
                     (title, lines)
                 }
-                Status::Checking => (
+                (Status::Checking, _) => (
                     title,
                     vec![Line::from(Span::styled(
                         "Checking for updates…",
-                        Style::default().fg(Color::Cyan),
+                        Style::default().fg(TEAL),
                     ))],
                 ),
-                Status::Error => (
-                    title,
-                    vec![Line::from(Span::styled(
+                (Status::Error, _) => {
+                    let mut lines = vec![Line::from(Span::styled(
                         "Failed to check for updates.",
-                        Style::default().fg(Color::Red),
-                    ))],
-                ),
-                Status::Unchecked => (title, vec![Line::from("")]),
+                        Style::default().fg(RED),
+                    ))];
+                    if let Some(err) = &tool.check_error {
+                        lines.push(Line::from(Span::styled(
+                            err.clone(),
+                            Style::default().fg(MUTED),
+                        )));
+                    }
+                    (title, lines)
+                }
+                (Status::Unchecked, _) => (title, vec![Line::from("")]),
+                // Defensive: a status derived from a release that has since
+                // gone missing. Should not happen.
+                (Status::UpdateAvailable | Status::UpToDate, None) => (title, vec![Line::from("")]),
             }
         }
-        None => (" Details ".to_string(), vec![Line::from("")]),
+        None => (
+            Line::from(Span::styled(" Details ", details_title_style)),
+            vec![Line::from("")],
+        ),
     };
 
-    let details_border = if app.focus == Focus::Details {
-        Style::default().fg(Color::Cyan)
+    let details_border = if details_focused {
+        Style::default().fg(ACCENT)
     } else {
-        Style::default()
+        Style::default().fg(BORDER)
     };
 
     let scroll_indicator = if app.details_scroll > 0 {
@@ -1075,8 +1556,12 @@ fn ui(frame: &mut Frame, app: &mut App) {
         .block(
             Block::default()
                 .title(details_title)
-                .title_bottom(scroll_indicator)
+                .title_bottom(Line::from(Span::styled(
+                    scroll_indicator,
+                    Style::default().fg(MUTED),
+                )))
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(details_border),
         )
         .wrap(Wrap { trim: false })
@@ -1087,38 +1572,37 @@ fn ui(frame: &mut Frame, app: &mut App) {
     // Footer: key hints, or a transient notice if one is active
     let footer = if let Some(input) = &app.search_input {
         let mut spans = vec![
-            Span::styled(format!(" /{input}_"), Style::default().fg(Color::Yellow)),
             Span::styled(
-                "  Enter: keep  Esc: clear",
-                Style::default().fg(Color::DarkGray),
+                format!(" /{input}_"),
+                Style::default()
+                    .fg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
             ),
+            Span::styled("  Enter: keep  Esc: clear", Style::default().fg(MUTED)),
         ];
         if app.filter_error {
-            spans.push(Span::styled(
-                "  invalid regex",
-                Style::default().fg(Color::Red),
-            ));
+            spans.push(Span::styled("  invalid regex", Style::default().fg(RED)));
         }
         Line::from(spans)
     } else if let Some((msg, color)) = &app.notice {
         Line::from(Span::styled(format!(" {msg}"), Style::default().fg(*color)))
     } else {
-        Line::from(vec![
-            Span::styled(" q", Style::default().fg(Color::Yellow)),
-            Span::raw(": quit  "),
-            Span::styled("r", Style::default().fg(Color::Yellow)),
-            Span::raw(": refresh  "),
-            Span::styled("/", Style::default().fg(Color::Yellow)),
-            Span::raw(": search  "),
-            Span::styled("d", Style::default().fg(Color::Yellow)),
-            Span::raw(": dry-run  "),
-            Span::styled("u", Style::default().fg(Color::Yellow)),
-            Span::raw(": update  "),
-            Span::styled("←/→", Style::default().fg(Color::Yellow)),
-            Span::raw(": pane  "),
-            Span::styled("↑/k ↓/j", Style::default().fg(Color::Yellow)),
-            Span::raw(": nav/scroll"),
-        ])
+        let mut spans = vec![Span::raw(" ")];
+        for (key, label) in [
+            ("q", "quit"),
+            ("r", "refresh"),
+            ("m", "mode"),
+            ("/", "search"),
+            ("d", "dry-run"),
+            ("u", "update"),
+        ] {
+            spans.extend(key_chip(key, label));
+        }
+        spans.push(Span::styled(
+            "  ↑/↓ nav · ←/→ pane",
+            Style::default().fg(MUTED),
+        ));
+        Line::from(spans)
     };
     frame.render_widget(Paragraph::new(footer), chunks[1]);
 
@@ -1136,14 +1620,12 @@ fn render_update_modal(frame: &mut Frame, modal: &UpdateModal) {
 
     if modal.ready {
         lines.push(Line::from(vec![
-            Span::styled("Version: ", Style::default().fg(Color::Gray)),
-            Span::raw(&plan.old_version),
-            Span::styled("  →  ", Style::default().fg(Color::Yellow)),
+            Span::styled("Version: ", Style::default().fg(MUTED)),
+            Span::styled(plan.old_version.clone(), Style::default().fg(TEXT)),
+            Span::styled("  →  ", Style::default().fg(MUTED)),
             Span::styled(
-                &plan.new_version,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                plan.new_version.clone(),
+                Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
             ),
         ]));
         lines.push(Line::from(""));
@@ -1151,13 +1633,13 @@ fn render_update_modal(frame: &mut Frame, modal: &UpdateModal) {
         if plan.hashes.is_empty() {
             lines.push(Line::from(Span::styled(
                 "No platform hashes to update.",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(MUTED),
             )));
         } else {
             lines.push(Line::from(Span::styled(
                 "Hashes:",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(TEAL)
                     .add_modifier(Modifier::BOLD),
             )));
             for h in &plan.hashes {
@@ -1166,23 +1648,25 @@ fn render_update_modal(frame: &mut Frame, modal: &UpdateModal) {
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("  {}", h.platform),
-                        Style::default().add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(TEXT)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         format!("  ({})", h.asset_name),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(MUTED),
                     ),
                 ]));
                 lines.push(Line::from(vec![
-                    Span::styled("    old: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(short_hash(old), Style::default().fg(Color::Red)),
+                    Span::styled("    old: ", Style::default().fg(MUTED)),
+                    Span::styled(short_hash(old), Style::default().fg(RED)),
                 ]));
                 lines.push(Line::from(vec![
-                    Span::styled("    new: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(short_hash(new), Style::default().fg(Color::Green)),
+                    Span::styled("    new: ", Style::default().fg(MUTED)),
+                    Span::styled(short_hash(new), Style::default().fg(GREEN)),
                     Span::styled(
                         if h.needs_download { "  (downloaded)" } else { "" },
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(MUTED),
                     ),
                 ]));
             }
@@ -1191,13 +1675,13 @@ fn render_update_modal(frame: &mut Frame, modal: &UpdateModal) {
         for warning in &plan.warnings {
             lines.push(Line::from(Span::styled(
                 format!("⚠ {warning}"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(YELLOW),
             )));
         }
     } else {
         lines.push(Line::from(Span::styled(
             format!("{spinner} Preparing update…"),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(TEAL),
         )));
     }
 
@@ -1205,25 +1689,27 @@ fn render_update_modal(frame: &mut Frame, modal: &UpdateModal) {
     let hint = if !modal.ready {
         Line::from(Span::styled(
             "working… (Esc cancels)".to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(MUTED),
         ))
     } else if modal.dry_run {
         Line::from(Span::styled(
             "dry-run — no files were changed.  Esc: close",
-            Style::default().fg(Color::Gray),
+            Style::default().fg(TEXT),
         ))
     } else if plan.hashes.is_empty() {
         Line::from(Span::styled(
             "nothing to write.  Esc: cancel",
-            Style::default().fg(Color::Gray),
+            Style::default().fg(TEXT),
         ))
     } else {
-        Line::from(vec![
-            Span::styled("Enter/y", Style::default().fg(Color::Yellow)),
-            Span::raw(": apply to tools.toml + hashes.toml  "),
-            Span::styled("Esc/n", Style::default().fg(Color::Yellow)),
-            Span::raw(": cancel"),
-        ])
+        let mut spans = Vec::new();
+        spans.extend(key_chip("Enter/y", "apply"));
+        spans.push(Span::styled(
+            " to tools.toml + hashes.toml  ",
+            Style::default().fg(MUTED),
+        ));
+        spans.extend(key_chip("Esc/n", "cancel"));
+        Line::from(spans)
     };
     lines.push(hint);
 
@@ -1261,9 +1747,16 @@ fn render_update_modal(frame: &mut Frame, modal: &UpdateModal) {
     let paragraph = Paragraph::new(lines)
         .block(
             Block::default()
-                .title(title)
+                .title(Line::from(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(TEXT)
+                        .add_modifier(Modifier::BOLD),
+                )))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(ACCENT))
+                .style(Style::default().bg(SURFACE)),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, modal_area);
@@ -1284,7 +1777,7 @@ fn run_app(
     tx: mpsc::Sender<AppMsg>,
 ) -> Result<()> {
     loop {
-        app.handle_results();
+        app.handle_results(&tx);
 
         terminal.draw(|frame| ui(frame, app))?;
 
@@ -1336,6 +1829,7 @@ fn run_app(
                     let tx = tx.clone();
                     app.refresh(tx, true);
                 }
+                KeyCode::Char('m') => app.toggle_mode(&tx),
                 KeyCode::Char('d') => app.begin_update(tx.clone(), true),
                 KeyCode::Char('u') => app.begin_update(tx.clone(), false),
                 KeyCode::Right => app.focus_details(),
@@ -1379,4 +1873,55 @@ fn main() -> Result<()> {
     terminal.show_cursor()?;
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn release_json(tag: &str, prerelease: bool, draft: bool) -> serde_json::Value {
+        serde_json::json!({
+            "tag_name": tag,
+            "body": "notes",
+            "prerelease": prerelease,
+            "draft": draft,
+        })
+    }
+
+    #[test]
+    fn best_semver_release_prefers_highest_over_flagged_latest() {
+        // Mirrors anomalyco/opencode: GitHub's "Latest" flag points at the
+        // 1.x line while newer 2.x releases exist.
+        let releases = [
+            release_json("v2.3.2", false, false),
+            release_json("v1.19.6", false, false),
+            release_json("v2.4.0-rc1", true, false),
+            release_json("v3.0.0", false, true),
+            release_json("process-daemon-v0.6.0", false, false),
+        ];
+        let best = best_semver_release(&releases).expect("a best release");
+        assert_eq!(best.version, "2.3.2");
+    }
+
+    #[test]
+    fn best_semver_release_skips_non_semver_tags() {
+        let releases = [release_json("release-2026", false, false)];
+        assert!(best_semver_release(&releases).is_none());
+    }
+
+    #[test]
+    fn highest_semver_is_an_update_where_flagged_latest_is_not() {
+        // dotup at 2.2.6: the GitHub "Latest" release (1.19.6) is not an
+        // update, but the highest semver (2.3.2) is.
+        assert_eq!(compare_versions("2.2.6", "1.19.6"), Status::UpToDate);
+        assert_eq!(compare_versions("2.2.6", "2.3.2"), Status::UpdateAvailable);
+    }
+
+    #[test]
+    fn severity_color_tints_by_bump_size() {
+        assert_eq!(severity_color("2.2.6", "3.0.0"), RED); // major
+        assert_eq!(severity_color("2.2.6", "2.3.2"), YELLOW); // minor
+        assert_eq!(severity_color("2.2.6", "2.2.7"), MUTED); // patch: dim
+        assert_eq!(severity_color("jq-1.7", "jq-1.8"), YELLOW); // non-semver
+    }
 }
